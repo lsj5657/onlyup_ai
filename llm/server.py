@@ -1,68 +1,80 @@
 import asyncio
 import websockets
-import whisper
-import numpy as np
+from google.cloud import speech
+import warnings
 import tempfile
 import soundfile as sf
-from gtts import gTTS
-from pydub import AudioSegment
-import io
-import warnings
+import numpy as np
+import time  # ✅ 시간 측정 추가
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-model = whisper.load_model("base")
-SAMPLE_RATE = 16000
+SAMPLE_RATE = 48000
+BUFFER_SECONDS = 5  # 5초 단위
+BUFFER_SIZE = SAMPLE_RATE * BUFFER_SECONDS
+
+client = speech.SpeechClient()
+
+config = speech.RecognitionConfig(
+    encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+    sample_rate_hertz=SAMPLE_RATE,
+    language_code="ko-KR"
+)
 
 async def transcribe_audio(websocket):
-    print("클라이언트 연결됨")
+    print("✅ 클라이언트 연결됨")
+    buffer = bytearray()
+    start_time = None  # ✅ 수신 시작 시간
+
     try:
         async for message in websocket:
-            print(f"전체 오디오 수신 (크기: {len(message)} bytes)")
-            audio_array = np.frombuffer(message, dtype=np.int16)
+            print(f"🎧 오디오 청크 수신! 크기: {len(message)} bytes")
+            buffer.extend(message)
 
-            # 오디오 파일로 저장
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
-                tmp_path = tmpfile.name
-                sf.write(tmp_path, audio_array, SAMPLE_RATE)
+            # 첫 데이터 들어올 때 시작 시간 기록
+            if start_time is None:
+                start_time = time.time()
 
-            try:
-                print("WAV 파일 저장 완료, Whisper STT 시작")
-                result = model.transcribe(tmp_path, language="ko")
-                text = result["text"]
-                print(f"인식 결과: {text}")
+            time_elapsed = time.time() - start_time
 
-                if text.strip():
-                    # TTS 생성
-                    print("TTS 생성 중...")
-                    tts = gTTS(text, lang='ko')
-                    mp3_fp = io.BytesIO()
-                    tts.write_to_fp(mp3_fp)
-                    mp3_fp.seek(0)
+            if len(buffer) >= BUFFER_SIZE and time_elapsed >= BUFFER_SECONDS:
+                print(f"🚀 {BUFFER_SECONDS}초 경과 & 데이터 모음 완료, STT 요청 시작")
 
-                    # mp3 -> wav 변환
-                    audio = AudioSegment.from_file(mp3_fp, format="mp3")
-                    wav_fp = io.BytesIO()
-                    audio.export(wav_fp, format="wav")
-                    wav_fp.seek(0)
-                    audio_bytes = wav_fp.read()
+                # WAV 파일로 저장
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
+                    audio_array = np.frombuffer(buffer, dtype=np.int16)
+                    sf.write(tmpfile.name, audio_array, SAMPLE_RATE)
+                    tmp_path = tmpfile.name
 
-                    # WAV 바이너리 전송
-                    await websocket.send(audio_bytes)
-                    print("오디오 전송 완료")
+                # Google STT 요청
+                with open(tmp_path, "rb") as f:
+                    audio_data = f.read()
+
+                audio = speech.RecognitionAudio(content=audio_data)
+
+                response = client.recognize(
+                    config=config,
+                    audio=audio
+                )
+
+                if response.results:
+                    transcript = response.results[0].alternatives[0].transcript
+                    print(f"📝 인식 결과: {transcript}")
+                    await websocket.send(transcript)
                 else:
-                    print("빈 결과, 전송 안 함")
+                    print("⚠️ 인식 결과 없음")
 
-            except Exception as e:
-                print(f"STT/TTS 처리 중 에러: {e}")
+                # 버퍼 & 타이머 초기화
+                buffer = bytearray()
+                start_time = None
 
-    except websockets.exceptions.ConnectionClosed as e:
-        print(f"클라이언트 연결 종료: {e}")
+    except websockets.exceptions.ConnectionClosed:
+        print("❗ 클라이언트 연결 종료")
     except Exception as e:
-        print(f"서버 에러: {e}")
+        print(f"❗ 서버 에러: {e}")
 
 async def main():
-    print("서버 실행 중 (ws://0.0.0.0:8000)")
+    print("🚀 서버 실행 중 (ws://0.0.0.0:8000)")
     async with websockets.serve(transcribe_audio, "0.0.0.0", 8000):
         await asyncio.Future()
 
