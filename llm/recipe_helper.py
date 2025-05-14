@@ -28,22 +28,28 @@ def extract_action_and_message(text: str):
                 action = extracted
     return action, message
 
-# 시작 메시지
+# 시작 안내
 print("🍳 요리를 시작합니다!")
-print("🔊 음성 출력:", recipe_steps[step_index])  # 첫 단계 안내
+print("🔊 음성 출력:", recipe_steps[step_index])
 
 while step_index < len(recipe_steps):
     user_input = input("👤 사용자: ")
 
     system_prompt = (
-        f"너는 레시피 요리 도우미야. 사용자의 발화를 보고 지금 단계에서 무엇을 해야 할지 판단해. "
-        f"현재 단계는 {step_index + 1}단계이고 내용은 다음과 같아: '{recipe_steps[step_index]}'.\n"
-        f"- 사용자가 완료했다고 말하면 행동: [NEXT]\n"
-        f"- 다시 설명해달라고 하면 행동: [REPLAY]\n"
-        f"- 그 외의 경우는 행동: [WAIT]\n"
-        f"메시지는 사용자에게 TTS로 읽어줄 내용이야.\n\n"
-        f"[출력 형식]\n메시지: ~~~~\n행동: [NEXT|REPLAY|WAIT]"
+        f"너는 요리 도우미야. 사용자의 발화를 듣고 행동을 [NEXT], [REPLAY], [WAIT] 중에서 정확하게 하나만 판단해줘.\n\n"
+        f"[현재 단계]: '{recipe_steps[step_index]}'\n\n"
+        f"[행동 기준]\n"
+        f"- 다음 표현이 들어 있으면 무조건 [NEXT]\n"
+        f"→ '다 했어', '끝났어', '완료', '다음 단계', '넘어가자', '다 만들었어'\n"
+        f"- 다음 표현이 들어 있으면 무조건 [REPLAY]\n"
+        f"→ '뭐라고', '다시', '다시 말해줘', '못 들었어', '한 번 더'\n"
+        f"- 위에 해당하지 않으면 [WAIT]\n\n"
+        f"[출력 형식]\n"
+        f"메시지: (사용자에게 읽어줄 말만 써. 절대 '메시지:'를 다시 쓰지 마!)\n"
+        f"행동: [NEXT|REPLAY|WAIT]"
     )
+
+
 
     messages = [
         SystemMessage(content=system_prompt),
@@ -55,9 +61,8 @@ while step_index < len(recipe_steps):
         action, message = extract_action_and_message(response.content)
 
         print("🤖 LLM 응답:")
-        print(f"메시지:", message)
+        print(f"메시지: {message}")
         print(f"행동: [{action}]")
-
 
         if action == "NEXT":
             step_index += 1
