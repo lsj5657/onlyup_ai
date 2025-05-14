@@ -7,13 +7,18 @@ import io
 import soundfile as sf
 from gtts import gTTS
 from pydub import AudioSegment
+import json
 
-# 🎯 마이크 기본 디바이스 정보 가져오기
+recipe_steps = [
+    "먼저 양파를 깍둑썰기 해주세요.",
+    "프라이팬에 기름을 두르고 양파를 볶아주세요.",
+    "양파가 투명해지면 계란을 넣고 잘 저어줍니다.",
+    "소금을 한 꼬집 넣고 마무리합니다."
+]
+
 device_info = sd.query_devices(0, 'input')
 SAMPLE_RATE = int(device_info['default_samplerate'])
-print(f"👉 사용 샘플레이트: {SAMPLE_RATE} Hz")
-
-CHUNK_DURATION = 0.5  # 0.5초 청크
+CHUNK_DURATION = 0.5
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
 
 async def send_audio(websocket):
@@ -23,72 +28,71 @@ async def send_audio(websocket):
         if status:
             print(f"⚠️ 마이크 상태 오류: {status}")
         else:
-            print(f"🎧 청크 캡처됨, 전송 중... (크기: {len(indata)})")
-
-        audio_bytes = indata.tobytes()
-        asyncio.run_coroutine_threadsafe(websocket.send(audio_bytes), loop)
+            asyncio.run_coroutine_threadsafe(websocket.send(indata.tobytes()), loop)
 
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
         callback=callback,
-        dtype='int16',      # LINEAR16 포맷
+        dtype='int16',
         blocksize=CHUNK_SIZE
     ):
-        print("🎤 실시간 마이크 전송 중... (중지: Ctrl+C)")
+        print("🎤 음성 전송 중... (Ctrl+C 중단)")
         while True:
             try:
                 result = await websocket.recv()
+                data = json.loads(result)
 
-                if isinstance(result, bytes):
-                    print("🔊 오디오 응답 수신, 재생 중...")
-                    wav_fp = io.BytesIO(result)
-                    data, samplerate = sf.read(wav_fp, dtype='int16')
+                msg_type = data.get("type")
+                message = data.get("message", "").strip()
+                if not message:
+                    continue
 
-                    play_obj = sa.play_buffer(
-                        data.tobytes(),
-                        num_channels=1,
-                        bytes_per_sample=2,
-                        sample_rate=samplerate
-                    )
-                else:
-                    print(f"📝 서버 인식 결과: {result}")
-                    print(f"받은 데이터 타입: {type(result)}, 크기: {len(result)}")
+                if msg_type == "speak":
+                    print(f"🗣️ 사용자 요청 응답: {message}")
+                elif msg_type == "step":
+                    print(f"➡️ 다음 단계: {message}")
+                elif msg_type == "end":
+                    print(f"🎉 완료 안내: {message}")
+                    break
 
-                    # 🆕 클라이언트에서 직접 TTS 생성 및 재생
-                    if result.strip():
-                        print("🗣️ 클라이언트에서 TTS 생성 및 재생 시작...")
-                        tts = gTTS(result, lang='ko')
-                        mp3_fp = io.BytesIO()
-                        tts.write_to_fp(mp3_fp)
-                        mp3_fp.seek(0)
+                # TTS 재생
+                tts = gTTS(message, lang='ko')
+                mp3_fp = io.BytesIO()
+                tts.write_to_fp(mp3_fp)
+                mp3_fp.seek(0)
+                audio = AudioSegment.from_file(mp3_fp, format="mp3")
+                wav_fp = io.BytesIO()
+                audio.export(wav_fp, format="wav")
+                wav_fp.seek(0)
+                data, samplerate = sf.read(wav_fp, dtype='int16')
 
-                        # mp3 -> wav 변환
-                        audio = AudioSegment.from_file(mp3_fp, format="mp3")
-                        wav_fp = io.BytesIO()
-                        audio.export(wav_fp, format="wav")
-                        wav_fp.seek(0)
-                        data, samplerate = sf.read(wav_fp, dtype='int16')
-
-                        play_obj = sa.play_buffer(
-                            data.tobytes(),
-                            num_channels=1,
-                            bytes_per_sample=2,
-                            sample_rate=samplerate
-                        )
-                        print("✅ 클라이언트 TTS 재생 완료")
+                sa.play_buffer(
+                    data.tobytes(),
+                    num_channels=1,
+                    bytes_per_sample=2,
+                    sample_rate=samplerate
+                )
 
             except websockets.exceptions.ConnectionClosed:
-                print("🚫 서버와의 연결 종료")
+                print("🚫 서버 연결 종료")
                 break
 
 async def main():
     uri = "ws://localhost:8000"
     async with websockets.connect(uri) as websocket:
-        print("✅ WebSocket 연결됨, 실시간 스트리밍 시작")
+        # 1. 레시피 전송
+        await websocket.send(json.dumps(recipe_steps))
+
+        # 2. 서버 응답 대기
+        init_ack = await websocket.recv()
+        print(f"📡 서버 응답: {init_ack}")
+
+        # 3. 이후 음성 전송 시작
         await send_audio(websocket)
 
-try:
-    asyncio.run(main())
-except Exception as e:
-    print(f"❗ 클라이언트 에러 발생: {e}")
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        print(f"❗ 클라이언트 에러: {e}")

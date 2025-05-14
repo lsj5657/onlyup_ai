@@ -1,60 +1,82 @@
 import asyncio
 import websockets
-from google.cloud import speech
-import warnings
 import tempfile
-import soundfile as sf
+import json
 import numpy as np
-import time
+import soundfile as sf
+from dotenv import load_dotenv
+from google.cloud import speech
+from langchain_community.chat_models import ChatOpenAI
+from langchain_core.messages import SystemMessage, HumanMessage
 
-warnings.filterwarnings("ignore", category=UserWarning)
+load_dotenv()
 
 SAMPLE_RATE = 48000
+SILENCE_THRESHOLD = 100
+SILENCE_FRAMES = 3
 BUFFER_SECONDS = 5
 BUFFER_SIZE = SAMPLE_RATE * BUFFER_SECONDS
-SILENCE_THRESHOLD = 100       # 무음으로 간주할 에너지 기준
-SILENCE_FRAMES = 3            # 몇 프레임 연속 무음이면 버퍼를 전송할지
 
 client = speech.SpeechClient()
-
 config = speech.RecognitionConfig(
     encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
     sample_rate_hertz=SAMPLE_RATE,
     language_code="ko-KR"
 )
 
-async def transcribe_audio(websocket):
+llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.2)
+
+def extract_action_and_message(text: str):
+    action = "WAIT"
+    message = text.strip()
+    if "행동:" in text:
+        parts = text.split("행동:")
+        message = parts[0].strip()
+        action_line = parts[1].strip().splitlines()[0]
+        if "[" in action_line and "]" in action_line:
+            extracted = action_line.split("]")[0][1:].strip().upper()
+            if extracted in {"NEXT", "REPLAY", "WAIT"}:
+                action = extracted
+    if message.lower().startswith("메시지:"):
+        message = message[len("메시지:"):].strip(" '\"\n")
+    return action, message
+
+async def transcribe_and_respond(websocket):
     print("✅ 클라이언트 연결됨")
-    buffer = bytearray()
-    start_time = None
-    silence_counter = 0
-    previous_transcript = ""
 
     try:
+        init_message = await websocket.recv()
+        recipe_steps = json.loads(init_message)
+
+        if not isinstance(recipe_steps, list) or not all(isinstance(s, str) for s in recipe_steps):
+            raise ValueError("레시피는 문자열 리스트여야 합니다.")
+
+        print("📥 레시피 수신 완료:")
+        for i, step in enumerate(recipe_steps, 1):
+            print(f"  {i}. {step}")
+
+        await websocket.send("레시피 수신 완료")
+
+        # ✅ 첫 번째 단계 전송
+        await websocket.send(json.dumps({
+            "type": "step",
+            "message": recipe_steps[0]
+        }))
+
+        step_index = 0
+        buffer = bytearray()
+        silence_counter = 0
+        previous_transcript = ""
+
         async for message in websocket:
-            print(f"🎧 오디오 청크 수신! 크기: {len(message)} bytes")
             buffer.extend(message)
-
-            if start_time is None:
-                start_time = time.time()
-
-            # 🎯 무음 여부 판단
             audio_chunk = np.frombuffer(message, dtype=np.int16).astype(np.float32)
             energy = np.sqrt(np.mean(audio_chunk**2))
+            silence_counter = silence_counter + 1 if energy < SILENCE_THRESHOLD else 0
 
-            if energy < SILENCE_THRESHOLD:
-                silence_counter += 1
-                print(f"🔇 무음 감지 {silence_counter}/{SILENCE_FRAMES}")
-            else:
-                silence_counter = 0
-
-            # 무음이 일정 시간 지속되면 STT 수행
-            if silence_counter >= SILENCE_FRAMES or (len(buffer) >= BUFFER_SIZE):
-                print(f"🚀 STT 조건 충족 → 데이터 모음 완료, STT 요청 시작")
-
+            if silence_counter >= SILENCE_FRAMES or len(buffer) >= BUFFER_SIZE:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmpfile:
-                    audio_array = np.frombuffer(buffer, dtype=np.int16)
-                    sf.write(tmpfile.name, audio_array, SAMPLE_RATE)
+                    sf.write(tmpfile.name, np.frombuffer(buffer, dtype=np.int16), SAMPLE_RATE)
                     tmp_path = tmpfile.name
 
                 with open(tmp_path, "rb") as f:
@@ -66,26 +88,64 @@ async def transcribe_audio(websocket):
                 if response.results:
                     transcript = response.results[0].alternatives[0].transcript.strip()
                     if transcript and transcript != previous_transcript:
-                        print(f"📝 인식 결과: {transcript}")
-                        await websocket.send(transcript)
+                        print(f"📝 인식된 발화: {transcript}")
+
+                        system_prompt = (
+                            f"너는 요리 도우미야. 사용자의 발화를 듣고 행동을 [NEXT], [REPLAY], [WAIT] 중에서 정확하게 하나만 판단해줘.\n\n"
+                            f"[현재 단계]: '{recipe_steps[step_index]}'\n\n"
+                            f"[행동 기준]\n"
+                            f"- 다음 표현이 들어 있으면 무조건 [NEXT]\n"
+                            f"→ '다 했어', '끝났어', '완료', '다음 단계', '넘어가자', '다 만들었어'\n"
+                            f"- 다음 표현이 들어 있으면 무조건 [REPLAY]\n"
+                            f"→ '뭐라고', '다시', '다시 말해줘', '못 들었어', '한 번 더'\n"
+                            f"- 위에 해당하지 않으면 [WAIT]\n\n"
+                            f"[출력 형식]\n"
+                            f"메시지: (사용자에게 읽어줄 말만 써. 절대 '메시지:'를 다시 쓰지 마!)\n"
+                            f"행동: [NEXT|REPLAY|WAIT]"
+                        )
+
+                        messages = [
+                            SystemMessage(content=system_prompt),
+                            HumanMessage(content=transcript)
+                        ]
+                        response = llm.invoke(messages)
+                        action, message = extract_action_and_message(response.content)
+
+                        print(f"🤖 LLM 응답: {message} / 행동: [{action}]")
+
+                        if action == "REPLAY":
+                            await websocket.send(json.dumps({
+                                "type": "speak",
+                                "message": recipe_steps[step_index]
+                            }))
+                        elif action == "NEXT":
+                            step_index += 1
+                            if step_index < len(recipe_steps):
+                                await websocket.send(json.dumps({
+                                    "type": "step",
+                                    "message": recipe_steps[step_index]
+                                }))
+                            else:
+                                await websocket.send(json.dumps({
+                                    "type": "end",
+                                    "message": "🎉 요리를 완료했습니다!"
+                                }))
+                                break
+
+                        # WAIT은 전송하지 않음
                         previous_transcript = transcript
-                    else:
-                        print("⚠️ 중복 또는 빈 인식 결과")
-                else:
-                    print("⚠️ 인식 결과 없음")
 
                 buffer = bytearray()
-                start_time = None
                 silence_counter = 0
 
     except websockets.exceptions.ConnectionClosed:
-        print("❗ 클라이언트 연결 종료")
+        print("❌ 클라이언트 연결 종료")
     except Exception as e:
         print(f"❗ 서버 에러: {e}")
 
 async def main():
-    print("🚀 서버 실행 중 (ws://0.0.0.0:8000)")
-    async with websockets.serve(transcribe_audio, "0.0.0.0", 8000):
+    print("🚀 서버 실행 중: ws://0.0.0.0:8000")
+    async with websockets.serve(transcribe_and_respond, "0.0.0.0", 8000):
         await asyncio.Future()
 
 if __name__ == "__main__":
