@@ -30,14 +30,18 @@ async def send_audio(websocket):
         else:
             asyncio.run_coroutine_threadsafe(websocket.send(indata.tobytes()), loop)
 
-    with sd.InputStream(
+    input_stream = sd.InputStream(
         samplerate=SAMPLE_RATE,
         channels=1,
         callback=callback,
         dtype='int16',
         blocksize=CHUNK_SIZE
-    ):
-        print("🎤 음성 전송 중... (Ctrl+C 중단)")
+    )
+
+    input_stream.start()
+    print("🎤 음성 전송 중... (Ctrl+C 중단)")
+
+    try:
         while True:
             try:
                 result = await websocket.recv()
@@ -56,7 +60,10 @@ async def send_audio(websocket):
                     print(f"🎉 완료 안내: {message}")
                     break
 
-                # TTS 재생
+                # 🎵 마이크 일시 중단
+                input_stream.stop()
+
+                # TTS 생성 및 재생
                 tts = gTTS(message, lang='ko')
                 mp3_fp = io.BytesIO()
                 tts.write_to_fp(mp3_fp)
@@ -67,16 +74,25 @@ async def send_audio(websocket):
                 wav_fp.seek(0)
                 data, samplerate = sf.read(wav_fp, dtype='int16')
 
-                sa.play_buffer(
+                # 🎧 재생 및 종료 대기
+                play_obj = sa.play_buffer(
                     data.tobytes(),
                     num_channels=1,
                     bytes_per_sample=2,
                     sample_rate=samplerate
                 )
+                play_obj.wait_done()  # 재생 끝날 때까지 대기
+
+                # 🎤 마이크 재시작
+                input_stream.start()
 
             except websockets.exceptions.ConnectionClosed:
                 print("🚫 서버 연결 종료")
                 break
+
+    finally:
+        input_stream.stop()
+        input_stream.close()
 
 async def main():
     uri = "ws://localhost:8000"
