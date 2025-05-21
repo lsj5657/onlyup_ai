@@ -95,7 +95,7 @@ async def send_audio(websocket):
         input_stream.close()
 
 async def main():
-    uri = "ws://localhost:8000"
+    uri = "ws://localhost:8000/ws"
     async with websockets.connect(uri) as websocket:
         # 1. 레시피 전송
         await websocket.send(json.dumps(recipe_steps))

@@ -6,6 +6,7 @@ import numpy as np
 import soundfile as sf
 from dotenv import load_dotenv
 from google.cloud import speech
+from fastapi import WebSocket
 from langchain_community.chat_models import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -41,11 +42,14 @@ def extract_action_and_message(text: str):
         message = message[len("메시지:"):].strip(" '\"\n")
     return action, message
 
-async def transcribe_and_respond(websocket):
-    print("✅ 클라이언트 연결됨")
+
+async def transcribe_and_respond(websocket: WebSocket):
+    await websocket.accept()
+    print("✅ WebSocket 연결 수락됨")
 
     try:
-        init_message = await websocket.recv()
+        # 초기 메시지: 레시피 JSON 수신
+        init_message = await websocket.receive_text()
         recipe_steps = json.loads(init_message)
 
         if not isinstance(recipe_steps, list) or not all(isinstance(s, str) for s in recipe_steps):
@@ -55,10 +59,10 @@ async def transcribe_and_respond(websocket):
         for i, step in enumerate(recipe_steps, 1):
             print(f"  {i}. {step}")
 
-        await websocket.send("레시피 수신 완료")
+        await websocket.send_text("레시피 수신 완료")
 
-        # ✅ 첫 번째 단계 전송
-        await websocket.send(json.dumps({
+        # 첫 단계 전송
+        await websocket.send_text(json.dumps({
             "type": "step",
             "message": recipe_steps[0]
         }))
@@ -68,10 +72,11 @@ async def transcribe_and_respond(websocket):
         silence_counter = 0
         previous_transcript = ""
 
-        async for message in websocket:
-            buffer.extend(message)
-            audio_chunk = np.frombuffer(message, dtype=np.int16).astype(np.float32)
-            energy = np.sqrt(np.mean(audio_chunk**2))
+        while True:
+            data = await websocket.receive_bytes()
+            buffer.extend(data)
+            audio_chunk = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+            energy = np.sqrt(np.mean(audio_chunk ** 2))
             silence_counter = silence_counter + 1 if energy < SILENCE_THRESHOLD else 0
 
             if silence_counter >= SILENCE_FRAMES or len(buffer) >= BUFFER_SIZE:
@@ -114,39 +119,29 @@ async def transcribe_and_respond(websocket):
                         print(f"🤖 LLM 응답: {message} / 행동: [{action}]")
 
                         if action == "REPLAY":
-                            await websocket.send(json.dumps({
+                            await websocket.send_text(json.dumps({
                                 "type": "speak",
                                 "message": recipe_steps[step_index]
                             }))
                         elif action == "NEXT":
                             step_index += 1
                             if step_index < len(recipe_steps):
-                                await websocket.send(json.dumps({
+                                await websocket.send_text(json.dumps({
                                     "type": "step",
                                     "message": recipe_steps[step_index]
                                 }))
                             else:
-                                await websocket.send(json.dumps({
+                                await websocket.send_text(json.dumps({
                                     "type": "end",
                                     "message": "🎉 요리를 완료했습니다!"
                                 }))
                                 break
 
-                        # WAIT은 전송하지 않음
                         previous_transcript = transcript
 
                 buffer = bytearray()
                 silence_counter = 0
 
-    except websockets.exceptions.ConnectionClosed:
-        print("❌ 클라이언트 연결 종료")
     except Exception as e:
-        print(f"❗ 서버 에러: {e}")
-
-async def main():
-    print("🚀 서버 실행 중: ws://0.0.0.0:8000")
-    async with websockets.serve(transcribe_and_respond, "0.0.0.0", 8000):
-        await asyncio.Future()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+        print(f"❗ WebSocket 서버 처리 중 오류 발생: {e}")
+        await websocket.close()
