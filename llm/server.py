@@ -116,7 +116,7 @@ async def transcribe_and_respond(websocket: WebSocket):
                         response = llm.invoke(messages)
                         action, message = extract_action_and_message(response.content)
 
-                        print(f"🤖 LLM 응답: {message} / 행동: [{action}]")
+                        print(f"[{action}]")
 
                         if action == "REPLAY":
                             await websocket.send_text(json.dumps({
